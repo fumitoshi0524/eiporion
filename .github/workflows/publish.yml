@@ -15,10 +15,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify tag is on main branch
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor ${{ github.ref }} origin/main
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Verify tag matches package version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "Tag version '$TAG_VERSION' does not match package version '$PKG_VERSION'"
+            exit 1
+          fi
+          echo "Publishing eiporion v$PKG_VERSION"
 
       - name: Build package
         run: |
