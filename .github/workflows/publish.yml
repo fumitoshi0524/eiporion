@@ -41,6 +41,22 @@ jobs:
           python -m pip install build
           python -m build
 
+      - name: Verify wheel contents
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          python -m venv /tmp/check
+          /tmp/check/bin/pip install dist/*.whl --no-deps
+          /tmp/check/bin/python -c "
+          import importlib.metadata as m, os
+          v = m.version('eiporion')
+          tag = os.environ['TAG_NAME'].lstrip('v')
+          assert v == tag, f'wheel version {v} != tag {tag}'
+          names = {str(f) for f in m.files('eiporion')}
+          assert 'eiporion/__init__.py' in names, '__init__.py missing from wheel'
+          print(f'Wheel OK: eiporion=={v}')
+          "
+
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@v1.11.0
         with:
