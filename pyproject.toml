@@ -1,0 +1,29 @@
+[project]
+name = "eiporion"
+version = "0.1.0"
+description = "INT8 linear layers with DQT SR/MB-SR and bitsandbytes acceleration."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["bitsandbytes>=0.45.0,<0.46.0", "torch"]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["eiporion"]
+
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu124"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cuda" }
+torchvision = { index = "pytorch-cuda" }
+markupsafe = { index = "pypi" }
