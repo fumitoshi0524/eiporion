@@ -12,18 +12,3 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["eiporion"]
-
-
-[[tool.uv.index]]
-name = "pypi"
-url = "https://pypi.org/simple"
-default = true
-
-[[tool.uv.index]]
-name = "pytorch-cuda"
-url = "https://download.pytorch.org/whl/cu124"
-
-[tool.uv.sources]
-torch = { index = "pytorch-cuda" }
-torchvision = { index = "pytorch-cuda" }
-markupsafe = { index = "pypi" }
