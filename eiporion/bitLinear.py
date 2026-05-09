@@ -52,12 +52,17 @@ class BitLinear(nn.Module):
         )
         self.register_buffer("int_weight", int_init, persistent=True)
         self.register_buffer("weight_scale", scale_init, persistent=True)
+        handle = next_bit_handle()
         self.register_buffer(
             "_bit_handle",
-            torch.tensor(next_bit_handle(), dtype=torch.int64),
+            torch.tensor(handle, dtype=torch.int64),
             persistent=True,
         )
-        self._registered_handle = int(self._bit_handle.item())
+        self._registered_handle = (
+            int(self._bit_handle.item())
+            if self._bit_handle.device.type != "meta"
+            else handle
+        )
         self.register_load_state_dict_post_hook(self._post_load_state_dict)
 
         if bias:
