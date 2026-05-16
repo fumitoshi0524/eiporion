@@ -106,6 +106,76 @@ def quantize_fp_to_int8(weight: torch.Tensor, eps: float = 1e-8):
     return q.contiguous(), scale.squeeze(1).contiguous()
 
 
+@torch.no_grad()
+def check_high_saturation(
+    int_weight: torch.Tensor,
+    saturation_q: int = 126,
+    saturation_ratio: float = 0.15,
+) -> bool:
+    """Check whether near-limit INT8 occupancy is high."""
+    if int_weight.ndim != 2:
+        raise ValueError(
+            f"int_weight must be 2D [out_features, in_features], got {tuple(int_weight.shape)}"
+        )
+    if not (1 <= int(saturation_q) <= 127):
+        raise ValueError(f"saturation_q must be in [1, 127], got {saturation_q}")
+    if not (0.0 <= float(saturation_ratio) <= 1.0):
+        raise ValueError(
+            f"saturation_ratio must be in [0.0, 1.0], got {saturation_ratio}"
+        )
+    near_limit = int_weight.abs() >= int(saturation_q)
+    sat_ratio = near_limit.float().mean().item()
+    return sat_ratio >= float(saturation_ratio)
+
+
+@torch.no_grad()
+def recalibrate_weight_scale_(
+    int_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    eps: float = 1e-8,
+) -> None:
+    """Recompute weight_scale from effective weight as per-row max_abs / 127."""
+    if int_weight.ndim != 2:
+        raise ValueError(
+            f"int_weight must be 2D [out_features, in_features], got {tuple(int_weight.shape)}"
+        )
+    if weight_scale.ndim != 1 or weight_scale.shape[0] != int_weight.shape[0]:
+        raise ValueError(
+            f"weight_scale must be [out_features], got {tuple(weight_scale.shape)}"
+        )
+    eff_weight = int_weight.float() * weight_scale.float().unsqueeze(1)
+    recalib_int, recalib_scale = quantize_fp_to_int8(eff_weight, eps=eps)
+    int_weight.copy_(recalib_int.to(device=int_weight.device))
+    weight_scale.copy_(
+        recalib_scale.to(device=weight_scale.device, dtype=weight_scale.dtype)
+    )
+
+
+@torch.no_grad()
+def guarantee_weight_scale_headroom_(
+    int_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    handle: int | None = None,
+    saturation_q: int = 126,
+    saturation_ratio: float = 0.15,
+    eps: float = 1e-8,
+) -> bool:
+    """Guarantee function: check saturation and recalibrate scale when needed."""
+    if not check_high_saturation(
+        int_weight=int_weight,
+        saturation_q=saturation_q,
+        saturation_ratio=saturation_ratio,
+    ):
+        return False
+
+    recalibrate_weight_scale_(
+        int_weight=int_weight, weight_scale=weight_scale, eps=eps
+    )
+    if handle is not None:
+        _invalidate_weight_cache(int(handle))
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Int8LinearFn
 # ---------------------------------------------------------------------------

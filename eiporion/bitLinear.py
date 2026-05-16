@@ -6,6 +6,7 @@ from torch import nn
 from .eiporionkernels import (
     Int8LinearFn,
     consume_bit_grad,
+    guarantee_weight_scale_headroom_,
     next_bit_handle,
     register_bit_handle,
     release_bit_handle,
@@ -100,6 +101,35 @@ class BitLinear(nn.Module):
 
     def consume_weight_grad(self) -> torch.Tensor | None:
         return consume_bit_grad(int(self._bit_handle.item()))
+
+    @torch.no_grad()
+    def guarantee_int8_(  # keeping the misspelt alias below for backwards compatibility
+        self,
+        saturation_q: int = 126,
+        saturation_ratio: float = 0.15,
+        eps: float = 1e-8,
+    ) -> bool:
+        return guarantee_weight_scale_headroom_(
+            int_weight=self.int_weight,
+            weight_scale=self.weight_scale,
+            handle=int(self._bit_handle.item()),
+            saturation_q=saturation_q,
+            saturation_ratio=saturation_ratio,
+            eps=eps,
+        )
+
+    @torch.no_grad()
+    def garantee_int8_(  # typo-compatible alias
+        self,
+        saturation_q: int = 126,
+        saturation_ratio: float = 0.15,
+        eps: float = 1e-8,
+    ) -> bool:
+        return self.guarantee_int8_(
+            saturation_q=saturation_q,
+            saturation_ratio=saturation_ratio,
+            eps=eps,
+        )
 
     def _post_load_state_dict(self, module, incompatible_keys) -> None:
         del module, incompatible_keys

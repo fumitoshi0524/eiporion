@@ -1,6 +1,6 @@
 [project]
 name = "eiporion"
-version = "0.1.1"
+version = "0.1.2"
 description = "INT8 linear layers with DQT SR/MB-SR and bitsandbytes acceleration."
 readme = "README.md"
 requires-python = ">=3.12"

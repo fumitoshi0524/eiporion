@@ -93,6 +93,7 @@ class EiporionOptim(AdamW8bit):
         bit_modules=None,
         block_size=256,
         sr_bias_scale=0.15,
+        guarantee_every_n_steps=200,
     ):
         super().__init__(
             params,
@@ -110,6 +111,12 @@ class EiporionOptim(AdamW8bit):
         self._bit_state: dict[int, dict[str, torch.Tensor | int]] = {}
         self.block_size = int(block_size)
         self.sr_bias_scale = float(sr_bias_scale)
+        self.guarantee_every_n_steps = int(guarantee_every_n_steps)
+        if self.guarantee_every_n_steps <= 0:
+            raise ValueError(
+                "guarantee_every_n_steps must be > 0, "
+                f"got {self.guarantee_every_n_steps}"
+            )
 
     def add_bit_modules(self, modules) -> None:
         for module in modules:
@@ -197,6 +204,16 @@ class EiporionOptim(AdamW8bit):
                 residual = residual - delta_q.float()
                 _invalidate_weight_cache(handle)
 
+            if (
+                t % self.guarantee_every_n_steps == 0
+                and module.guarantee_int8_(
+                    saturation_q=126, saturation_ratio=0.15, eps=eps
+                )
+            ):
+                new_ws = module.weight_scale.float().unsqueeze(1).clamp_min(eps)
+                # Preserve pending effective update when int-domain scale changes.
+                residual.mul_(ws / new_ws)
+
             r_q, r_absmax = _quantize_blockwise_signed(residual, bs)
             state["r_q"] = r_q
             state["r_absmax"] = r_absmax
@@ -245,6 +262,7 @@ class EiporionOptimSR(EiporionOptim):
         weight_decay=0.1,
         bit_modules=None,
         block_size=256,
+        guarantee_every_n_steps=200,
     ):
         super().__init__(
             params,
@@ -255,4 +273,5 @@ class EiporionOptimSR(EiporionOptim):
             bit_modules=bit_modules,
             block_size=block_size,
             sr_bias_scale=0.0,
+            guarantee_every_n_steps=guarantee_every_n_steps,
         )
