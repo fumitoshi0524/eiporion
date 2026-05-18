@@ -290,8 +290,22 @@ def _backward_impl(ctx, grad_out):
 
 
 @torch.no_grad()
-def update_int8_weight_(int_weight: torch.Tensor, delta_q: torch.Tensor) -> None:
-    """In-place int8 weight update:  W += delta_q, clamped to [-127, 127]."""
+def update_int8_weight_(
+    int_weight: torch.Tensor,  # [O, K] int8
+    delta_q: torch.Tensor,  # [O, K] int32
+    weight_scale: torch.Tensor,  # [O] float
+    eps: float = 1e-8,
+) -> None:
+    """In-place int8 weight update.
+
+    ``int_weight += delta_q`` (clamped to [-127, 127]), then recomputes
+    ``weight_scale = amax(|int_weight|, dim=1) / 127`` from the new values
+    — the same principle as `m_absmax` / `v_absmax` / `r_absmax` recomputed
+    every step.
+    """
     result = int_weight.to(torch.int16) + delta_q.to(torch.int16)
     result.clamp_(-127, 127)
     int_weight.copy_(result.to(torch.int8))
+
+    new_scale = int_weight.float().abs().amax(dim=1).clamp_min(float(eps)) / 127.0
+    weight_scale.copy_(new_scale)

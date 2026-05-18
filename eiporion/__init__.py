@@ -5,6 +5,8 @@ from .eiporionkernels import (
     recalibrate_weight_scale_,
 )
 from .bitLinear import BitLinear, collect_bitlinear_modules
+# TODO(0.2.0): Remove EiporionOptim (MB-SR variant), rename
+# EiporionOptimSR → EiporionOptim after removal.
 from .eiporionoptim import EiporionOptim, EiporionOptimSR
 
 __all__ = [

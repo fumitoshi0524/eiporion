@@ -80,8 +80,14 @@ def _dequantize_blockwise_unsigned(q, absmax, blocksize, shape):
     return out_blocks.view(-1)[:numel].view(shape)
 
 
-class EiporionOptim(AdamW8bit):
-    """bnb AdamW8bit for dense params + 8-bit AdamW + DQT-SR for INT8 weights."""
+# TODO(0.2.0): Rename EiporionOptimSR → EiporionOptim after removing
+# the MB-SR variant (current EiporionOptim) below.  MB-SR showed no
+# improvement over pure SR in testing — see the class docstring for details.
+class EiporionOptimSR(AdamW8bit):
+    """bnb AdamW8bit for dense params + 8-bit AdamW + DQT-SR for INT8 weights.
+
+    Pure unbiased stochastic rounding — no momentum bias.
+    """
 
     def __init__(
         self,
@@ -92,8 +98,6 @@ class EiporionOptim(AdamW8bit):
         weight_decay=0.1,
         bit_modules=None,
         block_size=256,
-        sr_bias_scale=0.15,
-        guarantee_every_n_steps=200,
     ):
         super().__init__(
             params,
@@ -110,13 +114,6 @@ class EiporionOptim(AdamW8bit):
         )
         self._bit_state: dict[int, dict[str, torch.Tensor | int]] = {}
         self.block_size = int(block_size)
-        self.sr_bias_scale = float(sr_bias_scale)
-        self.guarantee_every_n_steps = int(guarantee_every_n_steps)
-        if self.guarantee_every_n_steps <= 0:
-            raise ValueError(
-                "guarantee_every_n_steps must be > 0, "
-                f"got {self.guarantee_every_n_steps}"
-            )
 
     def add_bit_modules(self, modules) -> None:
         for module in modules:
@@ -190,29 +187,22 @@ class EiporionOptim(AdamW8bit):
             delta_w_eff = -lr * (adam_term + wd * iw * ws)
             residual = residual + delta_w_eff / ws
 
+            # Pure unbiased stochastic rounding
             abs_res = residual.abs()
             base = torch.floor(abs_res)
             frac = abs_res - base
-            # Momentum-biased SR
-            bias = torch.tanh(adam_term) * self.sr_bias_scale * torch.sign(residual)
-            frac_biased = (frac + bias).clamp(0.0, 1.0)
-            extra = (torch.rand_like(frac) < frac_biased).float()
+            extra = (torch.rand_like(frac) < frac).float()
             delta_q = (torch.sign(residual) * (base + extra)).to(torch.int32)
 
             if torch.any(delta_q != 0):
-                update_int8_weight_(module.int_weight, delta_q)
-                residual = residual - delta_q.float()
-                _invalidate_weight_cache(handle)
-
-            if (
-                t % self.guarantee_every_n_steps == 0
-                and module.guarantee_int8_(
-                    saturation_q=126, saturation_ratio=0.15, eps=eps
-                )
-            ):
+                old_ws = module.weight_scale.detach().clone()
+                update_int8_weight_(module.int_weight, delta_q, module.weight_scale)
+                residual.sub_(delta_q.float())
+                # weight_scale was recomputed from new int_weight — rescale
+                # residual so its FP-space value is preserved.
                 new_ws = module.weight_scale.float().unsqueeze(1).clamp_min(eps)
-                # Preserve pending effective update when int-domain scale changes.
-                residual.mul_(ws / new_ws)
+                residual.mul_((old_ws.unsqueeze(1) / new_ws))
+                _invalidate_weight_cache(handle)
 
             r_q, r_absmax = _quantize_blockwise_signed(residual, bs)
             state["r_q"] = r_q
@@ -250,8 +240,20 @@ class EiporionOptim(AdamW8bit):
             }
 
 
-class EiporionOptimSR(EiporionOptim):
-    """EiporionOptim with unbiased stochastic rounding (no momentum bias)."""
+# TODO(0.2.0): Remove this class.  MB-SR showed no improvement over pure SR
+# in testing:
+#   bias_frac_active = 99.2%  (almost every element gets biased)
+#   bias_mean_abs     = 0.00063
+#   cos(momentum, residual) went from ~0 (pure SR) to -0.0051 (MB-SR)
+#   residual_mean_abs unchanged (0.1051 vs 0.1053)
+# After removal, rename EiporionOptimSR → EiporionOptim.
+class EiporionOptim(AdamW8bit):
+    """bnb AdamW8bit for dense params + 8-bit AdamW + DQT MB-SR for INT8 weights.
+
+    Momentum-biased stochastic rounding.  Deprecated — prefer
+    :class:`EiporionOptimSR` which uses pure unbiased SR and will be
+    renamed to ``EiporionOptim`` in 0.2.0.
+    """
 
     def __init__(
         self,
@@ -262,7 +264,7 @@ class EiporionOptimSR(EiporionOptim):
         weight_decay=0.1,
         bit_modules=None,
         block_size=256,
-        guarantee_every_n_steps=200,
+        sr_bias_scale=0.15,
     ):
         super().__init__(
             params,
@@ -270,8 +272,139 @@ class EiporionOptimSR(EiporionOptim):
             betas=betas,
             eps=eps,
             weight_decay=weight_decay,
-            bit_modules=bit_modules,
-            block_size=block_size,
-            sr_bias_scale=0.0,
-            guarantee_every_n_steps=guarantee_every_n_steps,
         )
+        self.bit_modules = list(bit_modules) if bit_modules is not None else []
+        self._bit_handles = (
+            [int(m._bit_handle.item()) for m in self.bit_modules]
+            if bit_modules is not None
+            else []
+        )
+        self._bit_state: dict[int, dict[str, torch.Tensor | int]] = {}
+        self.block_size = int(block_size)
+        self.sr_bias_scale = float(sr_bias_scale)
+
+    def add_bit_modules(self, modules) -> None:
+        for module in modules:
+            if not isinstance(module, BitLinear):
+                raise TypeError(f"expected BitLinear, got {type(module).__name__}")
+            if module not in self.bit_modules:
+                self.bit_modules.append(module)
+                self._bit_handles.append(int(module._bit_handle.item()))
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = super().step(closure)
+
+        if not self.bit_modules:
+            return loss
+
+        group = self.param_groups[0]
+        lr = float(group["lr"])
+        beta1, beta2 = group["betas"]
+        eps = float(group["eps"])
+        wd = float(group["weight_decay"])
+        bs = self.block_size
+
+        for module, handle in zip(self.bit_modules, self._bit_handles):
+            g = module.consume_weight_grad()
+            if g is None:
+                continue
+            g = g.float().contiguous()
+
+            state = self._bit_state.setdefault(handle, {})
+            if "step" not in state:
+                state["step"] = 0
+                # 8-bit m, v (matching AdamW8bit scheme)
+                m_q, m_absmax = _quantize_blockwise_signed(
+                    torch.zeros_like(g, dtype=torch.float32), bs
+                )
+                v_q, v_absmax = _quantize_blockwise_unsigned(
+                    torch.zeros_like(g, dtype=torch.float32), bs
+                )
+                state["m_q"] = m_q
+                state["m_absmax"] = m_absmax
+                state["v_q"] = v_q
+                state["v_absmax"] = v_absmax
+                # residual also 8-bit blockwise, same scheme as m
+                r_q, r_absmax = _quantize_blockwise_signed(
+                    torch.zeros_like(g, dtype=torch.float32), bs
+                )
+                state["r_q"] = r_q
+                state["r_absmax"] = r_absmax
+
+            m = _dequantize_blockwise_signed(
+                state["m_q"], state["m_absmax"], bs, g.shape
+            )
+            v = _dequantize_blockwise_unsigned(
+                state["v_q"], state["v_absmax"], bs, g.shape
+            )
+            residual = _dequantize_blockwise_signed(
+                state["r_q"], state["r_absmax"], bs, g.shape
+            )
+            state["step"] += 1
+            t = state["step"]
+
+            m.mul_(beta1).add_(g, alpha=1.0 - beta1)
+            v.mul_(beta2).addcmul_(g, g, value=1.0 - beta2)
+            m_hat = m / (1.0 - beta1**t)
+            v_hat = v / (1.0 - beta2**t)
+
+            ws = module.weight_scale.float().unsqueeze(1).clamp_min(eps)
+            iw = module.int_weight.float()
+            adam_term = m_hat / (v_hat.sqrt() + eps)
+            delta_w_eff = -lr * (adam_term + wd * iw * ws)
+            residual = residual + delta_w_eff / ws
+
+            # Momentum-biased SR
+            abs_res = residual.abs()
+            base = torch.floor(abs_res)
+            frac = abs_res - base
+            bias = torch.tanh(adam_term) * self.sr_bias_scale * torch.sign(residual)
+            frac_biased = (frac + bias).clamp(0.0, 1.0)
+            extra = (torch.rand_like(frac) < frac_biased).float()
+            delta_q = (torch.sign(residual) * (base + extra)).to(torch.int32)
+
+            if torch.any(delta_q != 0):
+                old_ws = module.weight_scale.detach().clone()
+                update_int8_weight_(module.int_weight, delta_q, module.weight_scale)
+                residual.sub_(delta_q.float())
+                # weight_scale was recomputed from new int_weight — rescale
+                # residual so its FP-space value is preserved.
+                new_ws = module.weight_scale.float().unsqueeze(1).clamp_min(eps)
+                residual.mul_((old_ws.unsqueeze(1) / new_ws))
+                _invalidate_weight_cache(handle)
+
+            r_q, r_absmax = _quantize_blockwise_signed(residual, bs)
+            state["r_q"] = r_q
+            state["r_absmax"] = r_absmax
+
+            m_q, m_absmax = _quantize_blockwise_signed(m, bs)
+            v_q, v_absmax = _quantize_blockwise_unsigned(v, bs)
+            state["m_q"] = m_q
+            state["m_absmax"] = m_absmax
+            state["v_q"] = v_q
+            state["v_absmax"] = v_absmax
+
+        return loss
+
+    def state_dict(self):
+        state = super().state_dict()
+        state["bit_state"] = {
+            int(handle): {
+                key: value.detach().cpu() if torch.is_tensor(value) else value
+                for key, value in per_handle.items()
+            }
+            for handle, per_handle in self._bit_state.items()
+        }
+        return state
+
+    def load_state_dict(self, state_dict):
+        state_dict = dict(state_dict)
+        bit_state = state_dict.pop("bit_state", {})
+        super().load_state_dict(state_dict)
+        self._bit_state = {}
+        for handle, per_handle in bit_state.items():
+            self._bit_state[int(handle)] = {
+                key: value.clone() if torch.is_tensor(value) else value
+                for key, value in per_handle.items()
+            }

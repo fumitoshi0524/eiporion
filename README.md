@@ -1,6 +1,6 @@
 # Eiporion
 
-INT8 linear layers with DQT SR/MB-SR and bitsandbytes acceleration.
+INT8 linear layers with DQT stochastic rounding and bitsandbytes acceleration.
 
 ## Install
 

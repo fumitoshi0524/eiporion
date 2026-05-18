@@ -1,7 +1,7 @@
 [project]
 name = "eiporion"
-version = "0.1.2"
-description = "INT8 linear layers with DQT SR/MB-SR and bitsandbytes acceleration."
+version = "0.1.3"
+description = "INT8 linear layers with DQT stochastic rounding and bitsandbytes acceleration."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = ["bitsandbytes>=0.45.0,<0.46.0", "torch"]
