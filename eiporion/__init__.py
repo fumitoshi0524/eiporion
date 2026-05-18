@@ -7,11 +7,12 @@ from .eiporionkernels import (
 from .bitLinear import BitLinear, collect_bitlinear_modules
 # TODO(0.2.0): Remove EiporionOptim (MB-SR variant), rename
 # EiporionOptimSR → EiporionOptim after removal.
-from .eiporionoptim import EiporionOptim, EiporionOptimSR
+from .eiporionoptim import EiporionOptim, EiporionOptimECO, EiporionOptimSR
 
 __all__ = [
     "BitLinear",
     "EiporionOptim",
+    "EiporionOptimECO",
     "EiporionOptimSR",
     "check_high_saturation",
     "collect_bitlinear_modules",
