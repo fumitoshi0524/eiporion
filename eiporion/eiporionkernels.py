@@ -35,6 +35,8 @@ def release_bit_handle(handle: int) -> None:
     handle = int(handle)
     _REGISTERED_HANDLES.discard(handle)
     _BIT_GRAD_CACHE.pop(handle, None)
+    _BNB_WCACHE.pop(handle, None)
+    _BNB_WVERSION.pop(handle, None)
 
 
 def consume_bit_grad(handle: int) -> torch.Tensor | None:
@@ -45,44 +47,33 @@ def consume_bit_grad(handle: int) -> torch.Tensor | None:
 # bitsandbytes backend
 # ---------------------------------------------------------------------------
 _BNB_F = None
-_BNB_FMT = "col_ampere"
 
 try:
     import bitsandbytes.functional as _BNB_F
-
-    if torch.cuda.is_available():
-        cc = torch.cuda.get_device_capability()
-        if cc[0] >= 8:
-            _BNB_FMT = "col_ampere"
-        elif cc[0] == 7 and cc[1] >= 5:
-            _BNB_FMT = "col_turing"
-        else:
-            _BNB_FMT = "col32"
 except ImportError:
     pass
 
-# Weight-transform cache  (handle → (CxB, SB, version))
+# Weight-quantisation cache  (handle → (qw, scw, version))
 _BNB_WCACHE: dict[int, tuple] = {}
 _BNB_WVERSION: dict[int, int] = {}
 
 
-def _cached_weight_transform(
+def _cached_weight_quant(
     handle: int, int_weight: torch.Tensor, weight_scale: torch.Tensor
 ):
-    """Return (CxB, SB) for the current weight; re-transform only if stale."""
+    """Return (qw_int8, scw) for the current weight; re-quantise only if stale."""
     cur_ver = _BNB_WVERSION.get(handle, 0)
     entry = _BNB_WCACHE.get(handle)
     if entry is not None:
-        CxB, SB, cached_ver = entry
-        if cached_ver == cur_ver:
-            return CxB, SB
+        qw, scw, cached_ver = entry
+        if cached_ver == cur_ver and qw.shape == int_weight.shape:
+            return qw, scw
 
     # bitsandbytes expects fp16 input for int8_vectorwise_quant
     w_fp16 = int_weight.to(torch.float16) * weight_scale.to(torch.float16).unsqueeze(1)
-    w_q, _w_s, _ = _BNB_F.int8_vectorwise_quant(w_fp16)
-    CxB, SB = _BNB_F.transform(w_q, _BNB_FMT)
-    _BNB_WCACHE[handle] = (CxB, SB, cur_ver)
-    return CxB, SB
+    qw, scw, _ = _BNB_F.int8_vectorwise_quant(w_fp16)
+    _BNB_WCACHE[handle] = (qw, scw, cur_ver)
+    return qw, scw
 
 
 def _invalidate_weight_cache(handle: int):
@@ -191,6 +182,8 @@ class Int8LinearFn(torch.autograd.Function):
         bias: torch.Tensor | None,  # [O]     float
         handle: int,
     ):
+        if _BNB_F is not None and x2d.is_cuda:
+            return _forward_bnb(ctx, x2d, int_weight, weight_scale, bias, handle)
         return _forward_bf16(ctx, x2d, int_weight, weight_scale, bias, handle)
 
     @staticmethod
@@ -205,23 +198,18 @@ class Int8LinearFn(torch.autograd.Function):
 
 def _forward_bnb(ctx, x2d, int_weight, weight_scale, bias, handle):
     # 1. Quantise activation — bitsandbytes works in fp16
-    x_fp16 = x2d.half()
-    CA, SCA, _ = _BNB_F.int8_vectorwise_quant(x_fp16)
+    qx, scx, _ = _BNB_F.int8_vectorwise_quant(x2d.half())
 
-    # 2. Transform activation to col32 layout
-    C32A, SA = _BNB_F.transform(CA, "col32")
+    # 2. Get cached weight quantisation
+    qw, scw = _cached_weight_quant(handle, int_weight, weight_scale)
 
-    # 3. Get cached weight transform
-    CxB, SB = _cached_weight_transform(handle, int_weight, weight_scale)
+    # 3. INT8 matmul via cuBLASLt: out_i32 = qx @ qw.T
+    out_i32 = _BNB_F.int8_linear_matmul(qx, qw)
 
-    # 4. INT8 matmul via cuBLASLt
-    out_i32, _ = _BNB_F.igemmlt(C32A, CxB, SA, SB)
-
-    # 5. Dequantise — output must match activation scale × weight scale
-    out = _BNB_F.mm_dequant(out_i32, SCA, weight_scale.half().unsqueeze(1))
-
-    if bias is not None:
-        out.add_(bias.half())
+    # 4. Dequantise — output = out_i32 * activation_scale * weight_scale (+ bias)
+    out = _BNB_F.int8_mm_dequant(
+        out_i32, scx, scw, bias=bias.half() if bias is not None else None
+    )
 
     ctx.save_for_backward(x2d.to(torch.bfloat16), int_weight, weight_scale)
     ctx.handle = int(handle)

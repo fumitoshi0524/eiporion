@@ -33,7 +33,9 @@ class BitLinear(nn.Module):
 
     * ``int_weight``    — int8 buffer ``[O, K]``, the quantised weight (bnb's CB).
     * ``weight_scale``  — float buffer ``[O]``, per-row max_abs/127 (bnb's SCB/127).
-    * Forward: ``W_eff = int_weight * weight_scale``, then standard matmul.
+    * Forward computes ``W_eff = int_weight * weight_scale`` — via bitsandbytes
+      INT8 tensor cores on CUDA (activation also quantised to int8), or a BF16
+      matmul fallback elsewhere.
     * Gradients for ``int_weight`` are stashed in ``_BIT_GRAD_CACHE`` and consumed
     by :class:`EiporionOptim` for DQT stochastic rounding.
     """
